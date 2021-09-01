@@ -1,8 +1,9 @@
 # About This Repository
-Creating CSV Files
-Creating Files with raw Text
-Auto Header Generation
-Auto Folder creation of folder does not exist
+Creating CSV or raw text files.
+
+#Special Features
+Auto Header Generation.
+Auto Folder creation of folder does not exist.
 High speed writing up to maximum TwinCAT tick speed. Data is buffered between hard drive writes. User does not have to do anything to take advantage of this.
 Everything is wrapped into single function block for easy sharing. 
 Uses simple Methods for adding text and CSV data to file.
