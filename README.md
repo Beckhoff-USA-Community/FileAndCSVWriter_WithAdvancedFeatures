@@ -1,6 +1,11 @@
 # About This Repository
-
-This Repository is a template meant for basing new public repos off of. A new GitHub repo can be based off this template to automatically import the same GitIgnore and README file templates. After importing, replace this text to match the desired repo descriptions. This sample is created by [Beckhoff Automation LLC.](https://www.beckhoff.com/en-us/), and is provided as-is under the Zero-Clause BSD license.
+Creating CSV Files
+Creating Files with raw Text
+Auto Header Generation
+Auto Folder creation of folder does not exist
+High speed writing up to maximum TwinCAT tick speed. Data is buffered between hard drive writes. User does not have to do anything to take advantage of this.
+Everything is wrapped into single function block for easy sharing. 
+Uses simple Methods for adding text and CSV data to file.
 
 # How to get support
 Should you have any questions regarding the provided sample code, please contact your local Beckhoff support team. Contact information can be found on the official Beckhoff website at https://www.beckhoff.com/contact/.
