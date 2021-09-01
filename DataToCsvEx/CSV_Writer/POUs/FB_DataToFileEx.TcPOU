@@ -1,0 +1,896 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.9">
+  <POU Name="FB_DataToFileEx" Id="{c3a664cd-81aa-4e13-8e80-224ebd0401a3}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_DataToFileEx
+VAR_INPUT
+	sFileRoot: STRING := 'C:\Logs\';
+	sFileName: STRING := 'Log.csv';
+	sHeader:T_MaxString;//Header inside file. Ideal for CSV files that need column names
+
+	sFileNameHistory: STRING := 'LogOld.csv';	//If File exceeds 1 megabyte, file is renamed to this.
+END_VAR
+VAR_OUTPUT
+	udiErrId: UDINT;
+	xBusy: BOOL;
+	xError: BOOL;
+END_VAR
+VAR
+	///State machine
+	iStep: INT;
+	iErrorCounter: INT;
+	TonRetryTimer: TON;
+	fbRenameFile: FB_FileRename;
+	fbFileDelete: FB_FileDelete;
+	fbFileOpen: FB_FileOpen;
+	fbFileClose: FB_FileClose;
+	fbFileTell: FB_FileTell;
+	fbFileWrite: FB_FileWrite;
+	/// file handle of the source file 
+	hSrcFile: UINT := 0;
+	barrWriteBuffer: ARRAY[1..udiBufferSize] OF BYTE;
+	udiWriteBufferAddPos: UDINT := 1;
+	udiWriteBufferWritePos: UDINT := 1;
+	udiWriteBufferWriteLength: UDINT;
+	xFileHeaderNeeded:BOOL;
+	_sFileRoot:T_MAXSTRING;
+	
+	// Create Dir Method
+	xBusyCreateDirEx:BOOL;
+	xErrorCreateDirEx:BOOL;
+	udiErrorIdCreateDirEx:UDINT;
+	// End Create Dir Method
+	// File Exist Check Method
+	xFileExist: BOOL;
+	xBusyFileExistCheck: BOOL;
+	xErrorFileExistCheck: BOOL;
+	udiInternalErrorIDFileExistCheck: UDINT;
+	// End File Exist Check Method
+	// Folder Exist Check Method
+	xFolderExist: BOOL;
+	xBusyFolderExistCheck: BOOL;
+	xErrorFolderExistCheck: BOOL;
+	udiInternalErrorIDFolderExistCheck: UDINT;
+	//EndFolder Exist Check Method
+END_VAR
+VAR CONSTANT
+	udiBufferSize: UDINT := 100000;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[//Features
+// Log data at any speeds, even as fast as TwinCAT can run, 50us speeds. Data is buffered while hard drive is busy, then written.
+// Auto Create Directory
+// Auto rename file if it exceeds 1 mega byte in size
+// Data can be CSV 
+// Data can be any formate by using M_LogData or M_LogString
+// Increase udiBufferSize if you are writing large amounts of data and notice missing data in file.
+// Header is automaticly created as needed.
+
+CASE iStep OF
+	0:	(* idle wait for error message to log*)
+		IF (udiWriteBufferAddPos <> udiWriteBufferWritePos) THEN
+			_sFileRoot:=sFileRoot;
+			IF _sFileRoot[Len(_sFileRoot)-1] <> 92 THEN
+				_sFileRoot:=CONCAT(_sFileRoot,'\');
+			END_IF 
+			xBusy := TRUE;
+			udiErrId:=0;
+			IF sHeader = '' THEN
+				iStep := 10;
+			ELSE
+				iStep:=2;
+			END_IF
+		END_IF
+
+	2: (*Check if file Exist, this state lets us know if the header needs to be added*)
+		FB_FileExistCheck(xExecute:=FALSE , sPathName:=CONCAT(_sFileRoot, sFileName), xAbort:=FALSE  );
+		FB_FileExistCheck(xExecute:=TRUE ,  sPathName:=CONCAT(_sFileRoot, sFileName), xAbort:=FALSE  );
+		iStep:=4;
+		
+	4:
+		FB_FileExistCheck(xExecute:=FALSE , sPathName:=CONCAT(_sFileRoot, sFileName), xAbort:=FALSE  );
+		IF NOT xBusyFileExistCheck THEN
+			IF NOT xErrorFileExistCheck THEN
+				IF xFileExist THEN
+					xFileHeaderNeeded:=FALSE;
+				ELSE
+					xFileHeaderNeeded:=TRUE;
+				END_IF
+				iStep:=10;
+			ELSE
+				udiErrId :=udiInternalErrorIDFileExistCheck;
+				xError := TRUE;
+				iStep:=1000;
+			END_IF
+		END_IF
+
+	10:	(* open source file *)
+		fbFileOpen(  bExecute := FALSE  );
+		fbFileOpen( 		sPathName := CONCAT(_sFileRoot, sFileName),
+						nMode := FOPEN_MODEAPPEND  OR FOPEN_MODETEXT,  (*FOPEN_MODETEXT  or FOPEN_MODEREAD or FOPEN_MODEWRITE *)
+						ePath := PATH_GENERIC,
+						tTimeout := T#1000ms,
+						bExecute := TRUE );
+		iStep := iStep + 10;
+
+
+	20:
+		fbFileOpen( bExecute := FALSE );
+		IF ( NOT fbFileOpen.bBusy ) THEN
+			IF ( fbFileOpen.bError ) THEN
+				IF fbFileOpen.nErrId = 1804 THEN //This occurs when the folder does not exist.
+					iStep:=300;
+				ELSE
+					udiErrId :=fbFileOpen.nErrId;
+					xError := TRUE;
+					iStep:=1000;
+				END_IF
+			ELSE
+				hSrcFile := fbFileOpen.hFile;
+				IF NOT xFileHeaderNeeded THEN
+					iStep := iStep + 10;
+				ELSE 
+					iStep:=iStep+2;
+				END_IF
+			END_IF
+		END_IF
+		
+	22: (*Header needed*)
+		fbFileWrite(bExecute := FALSE);
+		fbFileWrite(pWriteBuff:=ADR(sHeader),
+			cbWriteLen:=DINT_TO_UDINT(LEN(sHeader)),
+			hFile:=hSrcFile,
+			tTimeout := T#1000ms,
+			bExecute := TRUE );
+		iStep:=iStep+2;
+
+	24:
+		fbFileWrite(bExecute := FALSE);
+		IF ( NOT fbFileWrite.bBusy ) THEN
+			IF ( fbFileWrite.bError ) THEN
+				udiErrId :=fbFileWrite.nErrId;
+				xError := TRUE;
+				iStep:=1000;
+			ELSE
+				iStep := iStep+6;
+			END_IF
+		END_IF
+				
+	30:	(* Write to Source File *)
+		IF udiWriteBufferAddPos > udiWriteBufferWritePos THEN
+			udiWriteBufferWriteLength:=udiWriteBufferAddPos - udiWriteBufferWritePos;
+			
+			fbFileWrite(  bExecute := FALSE  );
+			fbFileWrite( 		pWriteBuff:=ADR(barrWriteBuffer[udiWriteBufferWritePos]),
+				cbWriteLen:=udiWriteBufferWriteLength,
+				hFile:=hSrcFile,
+				tTimeout := T#1000ms,
+				bExecute := TRUE );
+			
+			udiWriteBufferWritePos:=udiWriteBufferAddPos;
+		
+		ELSE
+			udiWriteBufferWriteLength:=udiBufferSize - udiWriteBufferWritePos+1;
+			
+			fbFileWrite(  bExecute := FALSE  );
+			fbFileWrite( 		pWriteBuff:=ADR(barrWriteBuffer[udiWriteBufferWritePos]),
+				cbWriteLen:=udiWriteBufferWriteLength,
+				hFile:=hSrcFile,
+				tTimeout := T#1000ms,
+				bExecute := TRUE );
+			
+			udiWriteBufferWritePos:=1;			
+		END_IF
+		iStep:=iStep+10;
+
+	40:
+		fbFileWrite(bExecute := FALSE);
+		IF ( NOT fbFileWrite.bBusy ) THEN
+			IF ( fbFileWrite.bError ) THEN
+				udiErrId :=fbFileWrite.nErrId;
+				xError := TRUE;
+				iStep:=1000;
+			ELSE
+				IF udiWriteBufferAddPos = udiWriteBufferWritePos THEN
+					iStep := iStep+10;
+				ELSE
+					iStep:=iStep-10;
+				END_IF
+			END_IF
+		END_IF
+
+	50:	(*Get File data Size information*)
+		fbFileTell(  bExecute := FALSE  );
+		fbFileTell( 		hFile:=hSrcFile,
+						tTimeout := T#1000ms,
+						bExecute := TRUE );
+		iStep:=iStep+10;
+
+
+	60:
+		fbFileTell(bExecute := FALSE);
+		IF ( NOT fbFileTell.bBusy ) THEN
+			IF NOT fbFileTell.bError THEN
+				iStep := iStep+10;
+			ELSE
+				udiErrId :=fbFileTell.nErrId;
+				xError := TRUE;
+				iStep:=1000;
+			END_IF
+		END_IF
+
+
+	70: (* close source file *)
+		fbFileClose( bExecute := FALSE );
+		fbFileClose( 		hFile:=hSrcFile,
+						bExecute:=TRUE,
+						tTimeout:=T#1000ms );
+		iStep := iStep + 10;
+
+
+	80:
+		fbFileClose(bExecute := FALSE);
+		IF ( NOT fbFileClose.bBusy ) THEN
+			IF ( fbFileClose.bError ) THEN
+				udiErrId :=fbFileTell.nErrId;
+				xError := TRUE;
+				iStep:=1000;
+				hSrcFile:=0;
+			ELSE
+				hSrcFile := 0;
+				IF fbFileTell.nSeekPos > 990000 THEN	(*If file is approaching 1 MB then lets start with a new log file*)
+					iStep:=200;
+				ELSE
+					iStep := iStep+10;
+				END_IF;
+			END_IF;
+		END_IF
+
+	90: (*Finished, reset*)
+		xError:=FALSE;
+		xBusy:=FALSE;
+		iStep:=0;
+
+	200:	(* Delete the last file*)
+		fbFileDelete(  bExecute := FALSE  );
+		fbFileDelete( 		sPathName :=CONCAT(_sFileRoot,sFileNameHistory),
+						ePath := PATH_GENERIC,
+						tTimeout := T#1000ms,
+						bExecute := TRUE );
+		iStep := iStep + 10;
+
+
+	210:
+		fbFileDelete( bExecute := FALSE );
+		IF ( NOT fbFileDelete.bBusy ) THEN
+			(*IF ( fbFileDelete.bError ) THEN (*ignore errors since this is expected*)
+				udiErrId := fbFileOpen.nErrId;
+				Step := 50;	
+			ELSE*)
+				iStep := iStep + 10;
+			(*END_IF*)
+		END_IF;
+
+	220:	(* rename files so that the new data has a lower file number and older data has a larger file number*)
+		fbRenameFile(  bExecute := FALSE  );
+		fbRenameFile( 	sOldName:=CONCAT(_sFileRoot,sFileName),
+						sNewName:=CONCAT(_sFileRoot,sFileNameHistory),
+						ePath := PATH_GENERIC,
+						tTimeout := T#1000ms,
+						bExecute := TRUE );
+		iStep := iStep + 10;
+
+	230:
+		fbRenameFile( bExecute := FALSE );
+		IF ( NOT fbRenameFile.bBusy ) THEN
+			(*IF ( fbRenameFile.bError ) THEN (*ignore errors since this is expected*)
+				udiErrId := fbRenameFile.nErrId;
+				Step := 50;	
+			ELSE*)
+
+				iStep := 90;
+
+			(*END_IF*)
+		END_IF;
+
+
+	300:	(*create directory *)
+		FB_CreateDirEx(sFileRoot:=_sFileRoot, xExecute := FALSE );
+		FB_CreateDirEx( 		sFileRoot:=_sFileRoot,	xExecute:=TRUE );
+		iStep := iStep + 10;
+
+
+	310:
+		FB_CreateDirEx(sFileRoot:=_sFileRoot,xExecute := FALSE);
+		IF NOT xBusyCreateDirEx THEN
+			IF NOT xErrorCreateDirEx THEN
+				iStep := 10;
+			ELSE
+				udiErrId := udiErrorIdCreateDirEx;
+				iStep:=1000;
+				xError := TRUE;
+				hSrcFile := 0;
+			END_IF;
+		END_IF
+
+	1000: (*error *)
+		IF (hSrcFile <> 0 ) THEN
+			iStep := 70; (* close the source file *)
+		ELSE
+			TonRetryTimer(IN:=TRUE, PT:=T#5S);
+			IF TonRetryTimer.Q THEN
+				TonRetryTimer(IN:=FALSE);
+				iStep := 0;	(* ready *)
+				xBusy := FALSE;
+			END_IF
+		END_IF
+
+	1001:(*Log shutdown*)
+			TonRetryTimer(IN:=TRUE, PT:=T#2h);
+			IF TonRetryTimer.Q THEN
+				TonRetryTimer(IN:=FALSE);
+				iStep := 0;	(* ready *)
+				xBusy := FALSE;
+				iErrorCounter:=0;
+			END_IF
+
+END_CASE]]></ST>
+    </Implementation>
+    <Method Name="FB_CreateDirEx" Id="{d4ae4041-8403-419b-896f-a8117fdf11ab}">
+      <Declaration><![CDATA[METHOD INTERNAL FB_CreateDirEx : BOOL
+VAR_INPUT
+	sFileRoot:T_MAXSTRING;
+	xExecute:BOOL;
+END_VAR
+VAR_INST
+	iStep:INT;
+	TrigExecute:R_TRIG;
+	fbCreateDir: FB_CreateDir;
+	sDirectoryToBeAdded:T_MAXSTRING;
+	iDirectoryLevel:INT;
+	iLevelCount:INT;
+	iStartPos:INT;
+	x:INT;
+	
+
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[//This method was copied from a CreateDirEx function block so that the function block doesn't need to be included
+TrigExecute(CLK:=xExecute);
+
+CASE iStep OF
+0:
+	IF TrigExecute.Q THEN
+		xErrorCreateDirEx := FALSE;
+		udiErrorIdCreateDirEx:=0;
+		iStep:=iStep+10;
+		iDirectoryLevel:=2;
+	ELSIF xExecute = FALSE THEN
+		xErrorCreateDirEx := FALSE;
+		udiErrorIdCreateDirEx:=0;
+	END_IF
+		
+
+10:
+	//First Find the "/" that matches the directory we want to check thate exist
+	iLevelCount:=0;
+	FOR x:=0 TO LEN(sFileRoot) BY 1 DO
+		IF sFileRoot[x] = 92 THEN
+			iLevelCount:=iLevelCount+1;
+			IF iLevelCount = iDirectoryLevel THEN
+				x:=x+1;
+				EXIT;
+			END_IF
+		END_IF
+	END_FOR
+	iStartPos:=x;
+	MEMCPY(ADR(sDirectoryToBeAdded),ADR(sFileRoot),iStartPos);
+	MEMSet(ADR(sDirectoryToBeAdded)+iStartPos,0,1);
+
+	FB_FolderExistCheck(xExecute:=FALSE , sPathName:= sDirectoryToBeAdded, xAbort:=FALSE);
+	FB_FolderExistCheck(xExecute:=TRUE , sPathName:= sDirectoryToBeAdded, xAbort:=FALSE);
+	iStep:=iStep+10;
+	
+20: //Check if directory is their
+	FB_FolderExistCheck(xExecute:=TRUE , sPathName:= sDirectoryToBeAdded, xAbort:=FALSE);
+	IF NOT xBusyFolderExistCheck THEN
+		IF NOT xErrorFolderExistCheck THEN
+			IF xFolderExist THEN
+				IF sDirectoryToBeAdded = sFileRoot THEN
+					iStep:=0; // Done
+				ELSE
+					iDirectoryLevel:=iDirectoryLevel+1;
+					iStep:=10;
+				END_IF
+			ELSE
+				iStep:=iStep+10;
+			END_IF
+		ELSE
+			//Error
+				udiErrorIdCreateDirEx := udiInternalErrorIDFolderExistCheck;
+				iStep:=0;
+				xErrorCreateDirEx := TRUE;
+		END_IF
+		FB_FolderExistCheck(xExecute:=FALSE, sPathName:= sDirectoryToBeAdded, xAbort:=FALSE );
+	END_IF
+
+30:	(*create directory *)
+	fbCreateDir( bExecute := FALSE );
+	fbCreateDir( 		sPathName:=sDirectoryToBeAdded,
+					ePath:=PATH_GENERIC,
+					bExecute:=TRUE,
+					tTimeout:=T#1000ms );
+	iStep := iStep + 10;
+
+
+40:
+	fbCreateDir(bExecute := FALSE);
+	IF NOT fbCreateDir.bBusy THEN
+		IF NOT fbCreateDir.bError THEN
+			iStep := 10;
+			iDirectoryLevel:=iDirectoryLevel+1;
+		ELSE
+			udiErrorIdCreateDirEx := fbCreateDir.nErrId;
+			iStep:=0;
+			xErrorCreateDirEx := TRUE;
+		END_IF;
+	END_IF
+		
+END_CASE
+
+xBusyCreateDirEx:=iStep<>0;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="FB_FileExistCheck" Id="{657b7218-2c18-4317-ad12-2bcc592d4a77}">
+      <Declaration><![CDATA[METHOD INTERNAL FB_FileExistCheck : BOOL
+VAR_INPUT
+	xExecute: BOOL;
+	sPathName: STRING;
+	xAbort: BOOL;
+END_VAR
+VAR_INST
+	TrigExecute: R_TRIG;
+	iState: BYTE;
+	fbEnum: FB_EnumFindFileEntry := (sNetID := '', tTimeout := TIME#5s0ms);
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[TrigExecute(CLK:=xExecute);
+CASE iState OF
+0:
+	IF TrigExecute.Q THEN (* flag set ? *)
+		fbEnum.eCmd := eEnumCmd_First; (* enum first entry *)
+		iState := 2;
+		xFileExist:=FALSE;
+		xErrorFileExistCheck:=FALSE;
+		fbEnum( bExecute := FALSE );
+		fbEnum( bExecute := TRUE, sPathName := sPathName);
+	END_IF
+
+1: (* enum one entry *)
+	IF xAbort THEN
+		fbEnum.eCmd := eEnumCmd_Abort;
+	END_IF
+	fbEnum( bExecute := FALSE );
+	fbEnum( bExecute := TRUE, sPathName := sPathName);
+	iState := 2;
+
+2: (* wait until function block not busy *)
+	fbEnum( bExecute := FALSE );
+	IF NOT fbEnum.bBusy THEN
+		IF NOT fbEnum.bError THEN
+			IF NOT fbEnum.bEOE THEN
+				(*Check for directory or file*)
+				IF fbEnum.stFindFile.fileAttributes.bDirectory THEN
+					iState:=1;
+					fbEnum.eCmd := eEnumCmd_Next; (* enum next entry *)
+				ELSE
+					//Found file
+					iState:=0;
+					xFileExist:=TRUE;
+				END_IF
+
+			ELSE (* no more entries *)
+				iState := 0;
+			END_IF
+		ELSE (* log error *)
+			xErrorFileExistCheck:=TRUE;
+			udiInternalErrorIDFileExistCheck:=fbEnum.nErrID;
+			iState := 0;
+		END_IF
+	END_IF
+END_CASE
+IF iState = 0 THEN
+	xBusyFileExistCheck:=FALSE;
+ELSE
+	xBusyFileExistCheck:=TRUE;
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="FB_FolderExistCheck" Id="{68faa0ce-dc45-497b-ba6e-b739d81efea6}">
+      <Declaration><![CDATA[METHOD INTERNAL FB_FolderExistCheck : BOOL
+VAR_INPUT
+	xExecute: BOOL;
+	sPathName: STRING;
+	xAbort: BOOL;
+END_VAR
+VAR_INST
+	sPathSearchName: STRING;
+	sChildDirectory: STRING;
+	TrigExecute: R_TRIG;
+	iState: BYTE;
+	fbEnum: FB_EnumFindFileEntry := (sNetID := '', tTimeout := TIME#5s0ms);
+	x: UINT;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[TrigExecute(CLK:=xExecute);
+CASE iState OF
+0:
+	IF TrigExecute.Q THEN (* flag set ? *)
+		fbEnum.eCmd := eEnumCmd_First; (* enum first entry *)
+		iState := 1;
+		xFolderExist:=FALSE;
+		sPathSearchName := sPathName;
+		// Remove \
+		IF Len(sPathName) > 0 THEN
+			IF sPathSearchName[Len(sPathName)-1] = 92 THEN
+				sPathSearchName[Len(sPathName)-1] := 0;
+			END_IF
+		
+			//Get the Child Name
+			FOR x:= INT_TO_UINT(LEN(sPathSearchName)-1) TO 0 BY -1 DO
+					IF sPathSearchName[x] = 92  THEN
+						IF INT_TO_UINT(LEN(sPathSearchName)) > x THEN
+							MEMCPY(ADR(sChildDirectory),ADR(sPathSearchName)+x+1,DINT_TO_UDINT(LEN(sPathSearchName))-x);
+						END_IF
+						EXIT;
+					END_IF
+			END_FOR
+		END_IF
+		xErrorFolderExistCheck:=FALSE;
+	END_IF
+
+1: (* enum one entry *)
+	IF xAbort THEN
+		fbEnum.eCmd := eEnumCmd_Abort;
+	END_IF
+	fbEnum( bExecute := FALSE );
+	fbEnum( bExecute := TRUE, sPathName := sPathSearchName);
+	iState := 2;
+
+2: (* wait until function block not busy *)
+	fbEnum( bExecute := FALSE );
+	IF NOT fbEnum.bBusy THEN
+		IF NOT fbEnum.bError THEN
+			IF NOT fbEnum.bEOE THEN
+				(*Check for directory or file*)
+				IF fbEnum.stFindFile.fileAttributes.bDirectory THEN
+					IF sChildDirectory = fbEnum.stFindFile.sFileName THEN
+						xFolderExist:=TRUE;
+						//Found file
+						iState:=0;
+					ELSE
+						iState:=1;
+						fbEnum.eCmd := eEnumCmd_Next; (* enum next entry *)
+					END_IF
+					
+				ELSE
+					iState:=1;
+					fbEnum.eCmd := eEnumCmd_Next; (* enum next entry *)
+					
+				END_IF
+
+			ELSE (* no more entries *)
+				iState := 0;
+			END_IF
+		ELSE (* log error *)
+			xErrorFolderExistCheck:=TRUE;
+			udiInternalErrorIDFolderExistCheck:=fbEnum.nErrID;
+			iState := 0;
+		END_IF
+	END_IF
+END_CASE
+IF iState = 0 THEN
+	xBusyFolderExistCheck:=FALSE;
+ELSE
+	xBusyFolderExistCheck:=TRUE;
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_LogAddChar" Id="{7fba833b-394a-4a70-94bc-8ea30fcd472f}">
+      <Declaration><![CDATA[{attribute 'object_name' := 'M_LogAddChar'}
+METHOD INTERNAL M_LogAddChar : BOOL
+VAR_INPUT
+	sChar: STRING(1);
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[//Use this to add a single Char to the log file. Great for adding comma's or carriage returns or Line feeds.
+
+MEMCPY(ADR(barrWriteBuffer[udiWriteBufferAddPos]),ADR(sChar),1);
+IF  udiWriteBufferAddPos < udiBufferSize THEN
+		udiWriteBufferAddPos:=udiWriteBufferAddPos +1;
+ELSE
+		udiWriteBufferAddPos:=1;
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_LogAddColumn" Id="{c9bd7953-8246-43cb-a17b-0550e81a1a54}">
+      <Declaration><![CDATA[{attribute 'object_name' := 'M_LogAddColumn'}
+METHOD INTERNAL M_LogAddColumn : BOOL
+VAR_INPUT
+	sColumn: STRING;
+END_VAR
+VAR
+	udiLength: UDINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[
+IF DINT_TO_UDINT(LEN(sColumn)) + udiWriteBufferAddPos - 1 <= udiBufferSize THEN
+	MEMCPY(	ADR(barrWriteBuffer[udiWriteBufferAddPos]), ADR(sColumn),DINT_TO_UDINT(LEN(sColumn)));
+	udiWriteBufferAddPos:=udiWriteBufferAddPos + DINT_TO_UDINT(LEN(sColumn));
+	IF udiWriteBufferAddPos > udiBufferSize THEN
+		udiWriteBufferAddPos:=1;
+	END_IF
+
+ELSE
+	udiLength:=udiBufferSize -udiWriteBufferAddPos + 1;
+	MEMCPY(	ADR(barrWriteBuffer[udiWriteBufferAddPos]), ADR(sColumn), udiLength);
+	
+	
+	MEMCPY(	ADR(barrWriteBuffer[1]), ADR(sColumn)+udiLength ,DINT_TO_UDINT(LEN(sColumn))-udiLength);
+	udiWriteBufferAddPos:=udiWriteBufferAddPos + DINT_TO_UDINT(LEN(sColumn)) -udiBufferSize ;
+
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_LogAsCsv_2column" Id="{58f78d69-b418-43c1-b683-1ad4d423bb97}">
+      <Declaration><![CDATA[{attribute 'object_name' := 'M_LogAsCsv_2column'}
+METHOD M_LogAsCsv_2column : BOOL
+VAR_INPUT
+	sColumn1: STRING;
+	sColumn2: STRING;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_LogAddColumn(sColumn1);
+M_LogAddChar(',');
+M_LogAddColumn(sColumn2);
+M_LogAddChar('$L');]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_LogAsCsv_3column" Id="{5c384725-6310-4f69-8ed2-fb740cd5f2c4}">
+      <Declaration><![CDATA[{attribute 'object_name' := 'M_LogAsCsv_3column'}
+METHOD M_LogAsCsv_3column : BOOL
+VAR_INPUT
+	sColumn1: STRING;
+	sColumn2: STRING;
+	sColumn3: STRING;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_LogAddColumn(sColumn1);
+M_LogAddChar(',');
+M_LogAddColumn(sColumn2);
+M_LogAddChar(',');
+M_LogAddColumn(sColumn3);
+M_LogAddChar('$L');]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_LogAsCsv_4column" Id="{249f5a8f-19fe-41f4-bcf7-1f32fe8e7b69}">
+      <Declaration><![CDATA[{attribute 'object_name' := 'M_LogAsCsv_4column'}
+METHOD M_LogAsCsv_4column : BOOL
+VAR_INPUT
+	sColumn1: STRING;
+	sColumn2: STRING;
+	sColumn3: STRING;
+	sColumn4: STRING;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_LogAddColumn(sColumn1);
+M_LogAddChar(',');
+M_LogAddColumn(sColumn2);
+M_LogAddChar(',');
+M_LogAddColumn(sColumn3);
+M_LogAddChar(',');
+M_LogAddColumn(sColumn4);
+M_LogAddChar('$L');]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_LogAsCsv_5column" Id="{ad7b354e-2892-44f1-8e44-813e1092642d}">
+      <Declaration><![CDATA[{attribute 'object_name' := 'M_LogAsCsv_5column'}
+METHOD M_LogAsCsv_5column : BOOL
+VAR_INPUT
+	sColumn1: STRING;
+	sColumn2: STRING;
+	sColumn3: STRING;
+	sColumn4: STRING;
+	sColumn5: STRING;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_LogAddColumn(sColumn1);
+M_LogAddChar(',');
+M_LogAddColumn(sColumn2);
+M_LogAddChar(',');
+M_LogAddColumn(sColumn3);
+M_LogAddChar(',');
+M_LogAddColumn(sColumn4);
+M_LogAddChar(',');
+M_LogAddColumn(sColumn5);
+M_LogAddChar('$L');]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_LogAsCsv_6column" Id="{8fce586c-1373-446b-ba4e-4841142c5b66}">
+      <Declaration><![CDATA[{attribute 'object_name' := 'M_LogAsCsv_6column'}
+METHOD M_LogAsCsv_6column : BOOL
+VAR_INPUT
+	sColumn1: STRING;
+	sColumn2: STRING;
+	sColumn3: STRING;
+	sColumn4: STRING;
+	sColumn5: STRING;
+	sColumn6: STRING;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_LogAddColumn(sColumn1);
+M_LogAddChar(',');
+M_LogAddColumn(sColumn2);
+M_LogAddChar(',');
+M_LogAddColumn(sColumn3);
+M_LogAddChar(',');
+M_LogAddColumn(sColumn4);
+M_LogAddChar(',');
+M_LogAddColumn(sColumn5);
+M_LogAddChar(',');
+M_LogAddColumn(sColumn6);
+M_LogAddChar('$L');]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_LogAsCsv_7column" Id="{94b0a608-fb10-4053-8b4a-32bd44752e66}">
+      <Declaration><![CDATA[{attribute 'object_name' := 'M_LogAsCsv_7column'}
+METHOD M_LogAsCsv_7column : BOOL
+VAR_INPUT
+	sColumn1: STRING;
+	sColumn2: STRING;
+	sColumn3: STRING;
+	sColumn4: STRING;
+	sColumn5: STRING;
+	sColumn6: STRING;
+	sColumn7: STRING;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[M_LogAddColumn(sColumn1);
+M_LogAddChar(',');
+M_LogAddColumn(sColumn2);
+M_LogAddChar(',');
+M_LogAddColumn(sColumn3);
+M_LogAddChar(',');
+M_LogAddColumn(sColumn4);
+M_LogAddChar(',');
+M_LogAddColumn(sColumn5);
+M_LogAddChar(',');
+M_LogAddColumn(sColumn6);
+M_LogAddChar(',');
+M_LogAddColumn(sColumn7);
+M_LogAddChar('$L');]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_LogData" Id="{63e9a47b-9638-4372-aade-b47f7344e125}">
+      <Declaration><![CDATA[{attribute 'object_name' := 'M_LogData'}
+METHOD M_LogData
+VAR_INPUT
+	pData: POINTER TO BYTE;
+	udiDataLength: UDINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[//This method can be used to Log Raw data of any type and any formate. Pass in a pointer and the number of bytes you wish to record. A carriage return is NOT added to this.
+
+IF pData <> 0 THEN
+	IF udiDataLength + udiWriteBufferAddPos - 1 <= udiBufferSize THEN
+		MEMCPY(	ADR(barrWriteBuffer[udiWriteBufferAddPos]), pData,udiDataLength);
+		udiWriteBufferAddPos:=udiWriteBufferAddPos +udiDataLength;
+		IF udiWriteBufferAddPos > udiBufferSize THEN
+			udiWriteBufferAddPos:=1;
+		END_IF
+	
+	ELSE
+		(*Note how to calcuate initial write length -> udiLength:=udiBufferSize -udiWriteBufferAddPos + 1;*)
+		MEMCPY(	ADR(barrWriteBuffer[udiWriteBufferAddPos]), pData, (udiBufferSize -udiWriteBufferAddPos + 1));
+	
+		MEMCPY(	ADR(barrWriteBuffer[1]), pData+(udiBufferSize -udiWriteBufferAddPos + 1) ,udiDataLength - (udiBufferSize -udiWriteBufferAddPos + 1));
+		udiWriteBufferAddPos:=udiWriteBufferAddPos + udiDataLength -udiBufferSize ;
+
+	END_IF
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_LogString" Id="{f5fc78de-e433-4ce1-b61e-f452f6618373}">
+      <Declaration><![CDATA[{attribute 'object_name' := 'M_LogString'}
+METHOD M_LogString
+VAR_INPUT
+	sColumn: STRING;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[//Will add a string, will not place a comma or a carriage return.
+M_LogAddColumn(sColumn);
+
+]]></ST>
+      </Implementation>
+    </Method>
+    <LineIds Name="FB_DataToFileEx">
+      <LineId Id="333" Count="0" />
+      <LineId Id="335" Count="6" />
+      <LineId Id="334" Count="0" />
+      <LineId Id="3" Count="230" />
+      <LineId Id="235" Count="36" />
+      <LineId Id="2" Count="0" />
+    </LineIds>
+    <LineIds Name="FB_DataToFileEx.FB_CreateDirEx">
+      <LineId Id="112" Count="0" />
+      <LineId Id="6" Count="29" />
+      <LineId Id="37" Count="0" />
+      <LineId Id="40" Count="0" />
+      <LineId Id="43" Count="50" />
+      <LineId Id="5" Count="0" />
+    </LineIds>
+    <LineIds Name="FB_DataToFileEx.FB_FileExistCheck">
+      <LineId Id="6" Count="48" />
+      <LineId Id="5" Count="0" />
+    </LineIds>
+    <LineIds Name="FB_DataToFileEx.FB_FolderExistCheck">
+      <LineId Id="6" Count="70" />
+      <LineId Id="5" Count="0" />
+    </LineIds>
+    <LineIds Name="FB_DataToFileEx.M_LogAddChar">
+      <LineId Id="13" Count="1" />
+      <LineId Id="3" Count="4" />
+      <LineId Id="2" Count="0" />
+    </LineIds>
+    <LineIds Name="FB_DataToFileEx.M_LogAddColumn">
+      <LineId Id="3" Count="15" />
+      <LineId Id="2" Count="0" />
+    </LineIds>
+    <LineIds Name="FB_DataToFileEx.M_LogAsCsv_2column">
+      <LineId Id="3" Count="2" />
+      <LineId Id="2" Count="0" />
+    </LineIds>
+    <LineIds Name="FB_DataToFileEx.M_LogAsCsv_3column">
+      <LineId Id="3" Count="4" />
+      <LineId Id="2" Count="0" />
+    </LineIds>
+    <LineIds Name="FB_DataToFileEx.M_LogAsCsv_4column">
+      <LineId Id="3" Count="6" />
+      <LineId Id="2" Count="0" />
+    </LineIds>
+    <LineIds Name="FB_DataToFileEx.M_LogAsCsv_5column">
+      <LineId Id="3" Count="8" />
+      <LineId Id="2" Count="0" />
+    </LineIds>
+    <LineIds Name="FB_DataToFileEx.M_LogAsCsv_6column">
+      <LineId Id="3" Count="10" />
+      <LineId Id="2" Count="0" />
+    </LineIds>
+    <LineIds Name="FB_DataToFileEx.M_LogAsCsv_7column">
+      <LineId Id="3" Count="12" />
+      <LineId Id="2" Count="0" />
+    </LineIds>
+    <LineIds Name="FB_DataToFileEx.M_LogData">
+      <LineId Id="25" Count="1" />
+      <LineId Id="3" Count="15" />
+      <LineId Id="2" Count="0" />
+    </LineIds>
+    <LineIds Name="FB_DataToFileEx.M_LogString">
+      <LineId Id="10" Count="0" />
+      <LineId Id="3" Count="1" />
+      <LineId Id="2" Count="0" />
+    </LineIds>
+  </POU>
+</TcPlcObject>

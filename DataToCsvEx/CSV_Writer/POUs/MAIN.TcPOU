@@ -1,0 +1,57 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.9">
+  <POU Name="MAIN" Id="{bb0bb8c9-51d4-4604-868f-f5d016f9a231}" SpecialFunc="None">
+    <Declaration><![CDATA[PROGRAM MAIN
+VAR
+	Counter:DINT;
+	FB_DataToFile:FB_DataToFileEx; //This is the function block. It must be in the variable declarion window.
+	xStartRecording:BOOL;
+	xRecordOnce:BOOL;
+	FileRoot:STRING:='C:\Logs\NewLog\';
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[//This must be called every PLC scan.
+FB_DataToFile(
+	sFileRoot:=FileRoot , 
+	sFileName:='MyLogFile.csv' , 
+	sHeader:= 'Column1,Column2,Column3', 
+	sFileNameHistory:='MyLogfileOld.csv' , 
+	udiErrId=> , 
+	xBusy=> , 
+	xError=> );
+
+//Use Methods to write to file. Method places data into buffer. FB_DataToFile cyclic call saves data to file.
+
+//TEST or TRY   /////   xStartRecording OR xRecordOnce to see it work!
+IF xStartRecording OR xRecordOnce THEN
+	xRecordOnce:=FALSE;
+	Counter:=Counter+1;
+	FB_DataToFile.M_LogAsCsv_2column('Hello World', DINT_TO_STRING(Counter));
+END_IF
+
+//Optional. For creating any type of file other then CSV.
+//FB_DataToFile.M_LogString(CONCAT(CONCAT('Hello World ', DINT_TO_STRING(Counter)),'$L')); //$L is a line feed
+
+]]></ST>
+    </Implementation>
+    <LineIds Name="MAIN">
+      <LineId Id="107" Count="0" />
+      <LineId Id="63" Count="6" />
+      <LineId Id="9" Count="0" />
+      <LineId Id="108" Count="0" />
+      <LineId Id="101" Count="0" />
+      <LineId Id="109" Count="0" />
+      <LineId Id="102" Count="0" />
+      <LineId Id="12" Count="1" />
+      <LineId Id="110" Count="0" />
+      <LineId Id="16" Count="0" />
+      <LineId Id="18" Count="0" />
+      <LineId Id="83" Count="0" />
+      <LineId Id="21" Count="0" />
+      <LineId Id="112" Count="0" />
+      <LineId Id="111" Count="0" />
+      <LineId Id="2" Count="0" />
+    </LineIds>
+  </POU>
+</TcPlcObject>
